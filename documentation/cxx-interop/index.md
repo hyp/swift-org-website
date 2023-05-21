@@ -424,6 +424,135 @@ var Portobello: MushroomKind { get }
 var Button: MushroomKind { get }
 ```
 
+### `#import <swift/bridging>`
+
+The following header will be in the toolchain search paths already, so you just need to import it. Once this header is imported, you'll have access to several annotations that are helpful for preparing your C++ headers (APIs) for Swift to import them. Some of the most helpful annotations:
+
+TODO 
+
+### Operators 
+
+C++ operators can usually be mapped to similar Swift operators. Sometimes, to promote Swift’s idioms, operators are imported semantically rather than directly:
+* `operator++` is mapped to a `successor` method in Swift
+* `operator--` is mapped to a `predecessor` method in Swift 
+* `operator*` is mapped to a `pointee` property
+* `operator[]` is mapped to a subscript in Swift
+* `operator()` is mapped to Swift's `callAsFunction`.
+
+Note: currently Swift cannot import templated operators.
+
+### Ranges -> Collections
+
+Swift will attempt to import C++ ranges as Swift Collections. This means that types with a `begin` and `end` method will be automatically conformed to Swift's `Collection` protocol. When using a C++ type that's been imported as a Swift `Collection`, you'll have acceess to all of the methods that Swift `Collection`s provide by default: `map`, `filter`, and so on. You'll also have access to some extra features, such as intializers that convert the C++ type to `Array` and `Set`. For example, if `vec` is a C++ `std::vector`, you will be able to autoamtically convert it to an array like this: `Array(vec)`. You can also iterate over `vec` in a for-loop: `for element in vec { print(element) }`. Or map it to a `String`: `vec.map(String.init)`. 
+
+**Why isn't my range beging bridged?**
+
+Sometimes your ranges aren't bridged automatically and it can be hard to figure out why. If your range isn't automatically conformed to the Swift `Collection` protocol, it's likely that we are having some trouble importing the range's iterator type. To figure out what's wrong, try manually conforming your range to `CxxCollection`. It's likely that you will get an error that your iterator does not conform to `CxxIterator`, so again, try conforming the type manually. For example:
+
+```c++
+// C++ header file, defines a std::vector specialization:
+using Vector = std::vector<int>;
+```
+
+```swift
+// Manual conformance produces: does not conform to protocol 'CxxSequence'
+extension Vector: CxxSequence {}
+
+// Next, try adding the `Element` protocol requirement manually.
+extension Vector: CxxSequence {
+  public typealias Element = Vector.const_iterator.Pointee
+}
+
+// Next, try manually adding the iterator conformance.
+extension Vector.const_iterator: UnsafeCxxInputIterator {}
+
+// Finally, try manually adding the `Equatable` conformance.
+extension Vector.const_iterator: Equatable {
+    public static func==(lhs: Vector.const_iterator, rhs: Vector.const_iterator) -> Bool {
+        <# for you to implement... #>
+    }
+}
+```
+
+It's fairly common for `Equatable` conformance to be the issue, so it may be a good idea to check that your iterator is `Equatable` as a first debugging step. It's fairly common for the compiler to be unable to automatically add an `Equatable` protocol conformance becuase we _cannot import templated operators_ (see above section). So, if your `operator==` is templated in C++, we won't be able to use it in Swift for the automatic `Equatable` conformance. You can work around this by providing a non-templated operator in C++ or just implementing it again in Swift (see example above).
+
+**Safety**
+
+It's unsafe to use C++ iterators, such as those returned from `begin` or `end` methods in Swift. With these C++ iterators it's easy to create lifetime issues if the iterator is used after the C++ type is destroyed (which lead to use-after-free), or even invalid memory accesses (if the iterators mis-match or read past the end of the range). So, you should use these Swift `Collection` APIs instead.
+
+**Beyond Collections**
+
+Swift also will automatically import C++ types that look like dictionaries as `CxxDictionary`s. `CxxDictionary` refines `CxxSequence` to provide a few other niceties, namely, a subscript operator that can look up key-value pairs, so 
+
+ ```c++
+// C++ header file, defines a std::map specialization:
+using Map = std::map<std::string, std::string>;
+```
+
+```swift
+func findAlex(inMap map: Map) -> std.string {
+    map["Alex"]
+}
+```
+
+The subscript is implemented using the map's `find` method. 
+
+When iterating over a `CxxDictionary`, each element will be a `CxxPair`. _C++ types with a `first` and `second` member will automatically be conformed to `CxxPair`._
+
+### Other special cases
+
+Swift also provides a few niceties when using common C++ APIs. For example, you can construct a C++ string from a Swift string and vice-versa. You can also construct a C++ string from a string literal:
+```swift
+let greeting: std.string = "Hello, World!" 
+```
+
+Another example is `Optional`. To convert a C++ optional (such as `std.optional`, but any user defined type will also work) to a Swift optional, simply call `Optional(fromCxx:)`, passing the C++ optional.
+
+Swift will also automatically synthesize `Equality` conformance, but only if a _non-templated_ `operator==` is present in C++. (We are working on `Hashable` as well.)
+
+### Class templates
+
+Currently, unspecialized class templates (i.e, `std.vector`) are not supported in Swift. Swift and C++ have very different models for "generic programming" and we have not yet finished developing the story around class template bridging. See some of the designs outlined in the vision document and this forum post:
+
+* [Vision Document]( https://github.com/zoecarver/swift/blob/docs/interop-roadmap/docs/CppInteroperability/ForwardVision.md)
+
+* [This forum post](https://forums.swift.org/t/bridging-c-templates-with-interop/55003)
+
+### Move only types
+
+C++ types with a move constructor and no copy constructor can be represented using Swift's new non-copyable types. These types will be imported automatically as as Swift non-copyable types when you pass `-Xfrontend -enable-experimental-move-only` to the compiler. This is expiremental, so there are lots of bugs. Use with caussion.
+
+If a type is not copyable or moveable, it can be mapped to a Swift class or reference type (as a foreign reference type). See the secion on foreign reference types to determine if this is the correct mapping for your type.
+
+### Reference types
+
+Whether a C++ class type is appropriate to import as a reference type is a complex question, and there are two primary criteria that go into answering it.
+
+The first criterion is whether object identity is part of the "value" of the type. Is comparing the address of two objects just asking whether they're stored at the same location, or it is deciding whether they represent the "same object" in a more significant sense? 
+
+The second criterion whether objects of the C++ class are always passed around by reference.  Are objects predominantly passed around using a pointer or reference type, such as a raw pointer (`*`), raw reference (`&` or `&&`), or smart pointer (like `std::unique_ptr` or `std::shared_ptr`)?  When passed by raw pointer or reference, is there an expectation that that memory is stable and will continue to stay valid, or are receivers expected to copy the object if they need to keep the value alive independently?  If objects are generally allocated and remain at a stable address, even if that address is not semantically part of the "value" of an object, the class may be idiomatically a reference type. This will sometimes be a judgment call for the programmer.
+
+(In the future we hope to support polymorphic C++ classes as well, but the current implementation does not suppor these types.)
+
+The first and most important criteria is often not possible for a compiler to answer automatically by just looking at the code. So, if you want the Swift compiler to import a C++ type as a refernece type, you must communciate this via one of the three reference attribute from teh Swift bridging header: 
+
+  - **Immortal** reference types are not designed to be managed individually by the program. Objects of these types are allocated and then intentionally "leaked" without tracking their uses. Sometimes these objects are not truly immortal: for example, they may be arena-allocated, with an expectation that they will only be referenced from other objects within the arena. Nonetheless, they aren't expected to be individually managed.
+
+    The only reasonable thing Swift can do with immortal reference types is import them as unmanaged classes.  This is perfectly fine when objects are truly immortal.  If the object is arena-allocated, this is unsafe, but it's essentially an unavoidable level of unsafety given the choices of the C++ API.
+    
+    To specify that a C++ type is an immortal reference type, use the TODO attribute. 
+
+  - **Shared** reference types are reference-counted with custom retain and release operations. In C++, this is nearly always done with a smart pointer like `std::shared_ptr` rather than expecting programmers to manually use retain and release. This is generally compatible with being imported as a managed type. Shared pointer types are either "intrusive" or "non-intrusive", which unfortunately ends up being relevant to semantics. `std::shared_ptr` is a non-intrusive shared pointer, which supports pointers of any type without needing any cooperation.  Intrusive shared pointers require cooperation but support some additional operations. Swift should endeavor to support both.
+  
+    To specify that a C++ type is a shared reference type, use the TODO attribute. This attribute expects two arguments: a retain and release function. These functions must be global functions that take exactly one argument and return void. The argument must be a pointer to the C++ type. Swift will call these custom retain and release functions where it would otherwise retain and release Swift classes. 
+    
+  - **Unique** reference types are owned by a single context at once, which must ultimately either destroy it or pass ownership of it to a different context. There are two common idioms for unique ownership in C++. The first is that the object is passed around using a raw pointer (or sometimes a reference) and eventually destroyed using the `delete` operator. The second is that this is automated using a move-only smart pointer such as `std::unique_ptr`. This kind of use of `std::unique_ptr` is often paired with "borrowed" uses that traffic in raw pointers temporarily extracted from the smart pointer; in particular, method calls on the class via `operator->` implicitly receive a raw pointer as `this`.
+    
+    Unique reference types have expiremental support tied to move-only types. See move only types section for more information.
+  
+TODO provide some examples (or maybe just link to an example project).
+
+
 ## Using C++ Standard Library from Swift
 
 
